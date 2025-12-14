@@ -51,7 +51,7 @@ export default function LoginPage() {
             <input className={inputClass(mode)} value={email} onChange={(e) => setEmail(e.target.value)} type="email" required />
           </div>
           <div className="grid gap-2">
-            <label className="text-sm opacity-80">密码（>= 6 位）</label>
+            <label className="text-sm opacity-80">密码（大于或等于6 位）</label>
             <input className={inputClass(mode)} value={password} onChange={(e) => setPassword(e.target.value)} type="password" required minLength={6} />
           </div>
           <button disabled={busy} className={primaryBtn(mode)}>{busy ? "处理中..." : (isSignUp ? "注册" : "登录")}</button>
