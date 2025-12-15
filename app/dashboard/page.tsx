@@ -1,15 +1,13 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Shell } from "@/components/Shell";
 import { TopBar } from "@/components/TopBar";
 import { supabaseBrowser } from "@/lib/supabaseBrowser";
 import { useUIMode } from "@/components/UIModeProvider";
 
-type Profile = { id: string; paid_at: string | null; unlock_at: string | null };
-type Proof = { id: number; status: "pending" | "approved" | "rejected"; created_at: string };
+type Profile = { id: string; paid_at: string | null; unlock_at: string | null; note: string | null };
 type Gainer = { symbol: string; name?: string; price?: number; changesPercentage?: number };
 
 export default function Dashboard() {
@@ -19,31 +17,29 @@ export default function Dashboard() {
 
   const [userId, setUserId] = useState<string | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
-  const [latestProof, setLatestProof] = useState<Proof | null>(null);
   const [loading, setLoading] = useState(true);
 
-  const [gainers, setGainers] = useState<Gainer[]>([]);
-  const [symbol, setSymbol] = useState("AAPL");
-  const [quote, setQuote] = useState<any>(null);
+  const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+
+  const [gainers, setGainers] = useState<Gainer[]>([]);
+
 
   useEffect(() => {
     (async () => {
       const { data } = await supabase.auth.getSession();
       const session = data.session;
       if (!session) { router.replace("/login"); return; }
+
       setUserId(session.user.id);
 
-      const { data: p } = await supabase.from("profiles").select("id, paid_at, unlock_at").eq("id", session.user.id).maybeSingle();
-      setProfile(p ?? { id: session.user.id, paid_at: null, unlock_at: null });
+      const { data: p } = await supabase
+        .from("profiles")
+        .select("id, paid_at, unlock_at, note")
+        .eq("id", session.user.id)
+        .maybeSingle();
 
-      const { data: proofs } = await supabase
-        .from("sponsor_proofs")
-        .select("id, status, created_at")
-        .order("id", { ascending: false })
-        .limit(1);
-
-      setLatestProof((proofs?.[0] as any) ?? null);
+      setProfile((p as any) ?? { id: session.user.id, paid_at: null, unlock_at: null, note: null });
       setLoading(false);
     })();
   }, [router, supabase]);
@@ -61,18 +57,36 @@ export default function Dashboard() {
     return { h, m, s };
   }, [unlockAtMs, now]);
 
-  async function refreshAll() {
+  async function refreshProfile() {
     if (!userId) return;
-    const { data: p } = await supabase.from("profiles").select("id, paid_at, unlock_at").eq("id", userId).maybeSingle();
+    const { data: p } = await supabase
+      .from("profiles")
+      .select("id, paid_at, unlock_at, note")
+      .eq("id", userId)
+      .maybeSingle();
     if (p) setProfile(p as any);
+  }
 
-    const { data: proofs } = await supabase
-      .from("sponsor_proofs")
-      .select("id, status, created_at")
-      .order("id", { ascending: false })
-      .limit(1);
+  async function startCooldown() {
+    if (!userId) return;
+    setBusy(true);
+    setErr(null);
 
-    setLatestProof((proofs?.[0] as any) ?? null);
+    const paidAt = new Date();
+    const unlockAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+    const { error } = await supabase
+      .from("profiles")
+      .update({
+        paid_at: paidAt.toISOString(),
+        unlock_at: unlockAt.toISOString(),
+        note: null,
+      })
+      .eq("id", userId);
+
+    setBusy(false);
+    if (error) { setErr(error.message); return; }
+    await refreshProfile();
   }
 
   async function loadData() {
@@ -83,16 +97,10 @@ export default function Dashboard() {
     } catch (e: any) { setErr(e?.message ?? "拉取榜单失败"); }
   }
 
-  async function loadQuote() {
-    setErr(null);
-    try {
-      const q = await fetch(`/api/quote?symbol=${encodeURIComponent(symbol)}`).then(r => r.json());
-      setQuote(Array.isArray(q) ? q[0] : q);
-    } catch (e: any) { setErr(e?.message ?? "拉取报价失败"); }
-  }
+
 
   useEffect(() => {
-    if (!loading && profile?.paid_at && !locked) { loadData(); loadQuote(); }
+    if (!loading && profile?.paid_at && !locked) { loadData(); }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loading, profile?.paid_at, locked]);
 
@@ -107,7 +115,7 @@ export default function Dashboard() {
           {userId ? <>用户：<span className="opacity-90">{userId.slice(0, 8)}…</span></> : null}
         </div>
         <div className="flex items-center gap-2">
-          <button className={btn(mode)} onClick={refreshAll}>刷新状态</button>
+          <button className={btn(mode)} onClick={refreshProfile}>刷新状态</button>
           <button className={btn(mode)} onClick={signOut}>退出登录</button>
         </div>
       </div>
@@ -115,18 +123,15 @@ export default function Dashboard() {
       {loading ? (
         <div className="mt-6 opacity-80">加载中…</div>
       ) : !profile?.paid_at ? (
-        <PaywallGate mode={mode} latestProof={latestProof} />
+        <PaywallGate mode={mode} startCooldown={startCooldown} busy={busy} err={err} />
       ) : locked ? (
         <LockedView mode={mode} remaining={remaining} unlockAt={profile?.unlock_at} />
       ) : (
         <UnlockedView
           mode={mode}
           gainers={gainers}
-          symbol={symbol}
-          setSymbol={setSymbol}
           quote={quote}
           loadData={loadData}
-          loadQuote={loadQuote}
           err={err}
         />
       )}
@@ -134,54 +139,64 @@ export default function Dashboard() {
   );
 }
 
-function PaywallGate({ mode, latestProof }: { mode: "glass" | "senior"; latestProof: Proof | null }) {
+function PaywallGate({
+  mode,
+  startCooldown,
+  busy,
+  err,
+}: {
+  mode: "glass" | "senior";
+  startCooldown: () => void;
+  busy: boolean;
+  err: string | null;
+}) {
   return (
     <div className={mode === "glass" ? "mt-6 glass-card rounded-3xl p-6" : "mt-6 senior-card rounded-2xl p-6"}>
-      <h2 className={mode === "glass" ? "text-xl font-semibold" : "text-2xl font-bold"}>赞助墙（必选）</h2>
+      <h2 className={mode === "glass" ? "text-xl font-semibold" : "text-2xl font-bold"}>24h 冷却（作业演示）</h2>
       <p className="mt-2 opacity-80 leading-relaxed">
-        你还没解锁。需要先完成赞助流程并上传凭证，审核通过后开始 24h 倒计时。
+        点击按钮立刻开始 24 小时倒计时。倒计时结束后解锁“涨跌幅龙虎榜”页面。
       </p>
 
-      <div className="mt-4 flex flex-wrap gap-3">
-        <Link className={primary(mode)} href="/sponsor">去提交赞助凭证</Link>
-      </div>
+      <button
+        className={mode === "glass"
+          ? "mt-4 rounded-2xl bg-white/15 px-4 py-3 text-sm font-semibold hover:bg-white/20 border border-white/15 disabled:opacity-50"
+          : "mt-4 rounded-xl bg-red-600 px-5 py-4 text-lg font-bold text-white hover:bg-red-700 disabled:opacity-50"}
+        onClick={startCooldown}
+        disabled={busy}
+        type="button"
+      >
+        {busy ? "启动中…" : "开始 24h 冷却"}
+      </button>
 
-      <div className="mt-4 text-sm opacity-80">
-        当前状态：{latestProof ? (
-          <>
-            <b className="opacity-90">{latestProof.status}</b>（{new Date(latestProof.created_at).toLocaleString()}）
-          </>
-        ) : (
-          <>未提交</>
-        )}
-      </div>
+      {err ? <div className="mt-3 text-sm opacity-90">{err}</div> : null}
 
       <p className="mt-3 text-xs opacity-70">
-        规则：即使审核通过，也必须等 24 小时才可查看股票价格与榜单。
+        商业逻辑：延迟解锁制造稀缺，倒计时降低不确定性，让奖励可预期。
       </p>
     </div>
   );
 }
+
 
 function LockedView({ mode, remaining, unlockAt }: { mode: "glass" | "senior"; remaining: any; unlockAt: string | null }) {
   return (
     <div className={mode === "glass" ? "mt-6 glass-card rounded-3xl p-6" : "mt-6 senior-card rounded-2xl p-6"}>
-      <h2 className={mode === "glass" ? "text-xl font-semibold" : "text-2xl font-bold"}>已审核通过，但还没到解锁时间</h2>
+      <h2 className={mode === "glass" ? "text-xl font-semibold" : "text-2xl font-bold"}>冷却中（未到解锁时间）</h2>
       <p className="mt-2 opacity-80">解锁时间：{unlockAt ? new Date(unlockAt).toLocaleString() : "—"}</p>
       <div className="mt-4 text-3xl font-semibold tabular-nums">{remaining ? `${pad(remaining.h)}:${pad(remaining.m)}:${pad(remaining.s)}` : "—"}</div>
-      <p className="mt-2 text-sm opacity-75">（作业的“24h 冷却”机制。）</p>
     </div>
   );
 }
 
-function UnlockedView({ mode, gainers, symbol, setSymbol, quote, loadData, loadQuote, err }: any) {
+function UnlockedView({ mode, gainers, quote, loadData, err }: any) {
   return (
     <div className="mt-6 grid gap-5 lg:grid-cols-2">
       <div className={mode === "glass" ? "glass-card rounded-3xl p-6" : "senior-card rounded-2xl p-6"}>
         <div className="flex items-center justify-between gap-3">
-          <h2 className={mode === "glass" ? "text-xl font-semibold" : "text-2xl font-bold"}>今日大涨榜（类“涨停”）</h2>
+          <h2 className={mode === "glass" ? "text-xl font-semibold" : "text-2xl font-bold"}>明日涨停预测榜（演示）</h2>
           <button className={btn(mode)} onClick={loadData}>刷新</button>
         </div>
+        <p className="mt-1 text-xs opacity-70">注：用“今日涨幅榜”数据模拟“明日涨停预测”的展示效果。</p>
         {err ? <div className="mt-3 text-sm">{err}</div> : null}
         <div className="mt-4 overflow-auto">
           <table className={mode === "glass" ? "w-full text-sm" : "w-full text-base"}>
@@ -209,29 +224,9 @@ function UnlockedView({ mode, gainers, symbol, setSymbol, quote, loadData, loadQ
             </tbody>
           </table>
         </div>
-        <p className="mt-3 text-xs opacity-70">主题会自动切换红涨绿跌 / 绿涨红跌。</p>
       </div>
 
-      <div className={mode === "glass" ? "glass-card rounded-3xl p-6" : "senior-card rounded-2xl p-6"}>
-        <div className="flex items-center justify-between gap-3">
-          <h2 className={mode === "glass" ? "text-xl font-semibold" : "text-2xl font-bold"}>当日价格查询</h2>
-          <button className={btn(mode)} onClick={loadQuote}>查询</button>
-        </div>
-
-        <div className="mt-4 flex gap-2">
-          <input className={input(mode)} value={symbol} onChange={(e) => setSymbol(e.target.value.toUpperCase())} placeholder="AAPL / TSLA / NVDA ..." />
-        </div>
-
-        {quote ? (
-          <div className="mt-4 grid gap-2 text-sm">
-            <Row label="名称" value={quote.name ?? "—"} />
-            <Row label="价格" value={fmt(quote.price)} delta={Number(quote.changePercentage ?? 0)} emphasize />
-            <Row label="涨跌" value={fmt(quote.change)} delta={Number(quote.change ?? 0)} />
-            <Row label="涨跌幅" value={fmtPct(quote.changePercentage)} delta={Number(quote.changePercentage ?? 0)} />
-            <Row label="成交量" value={fmt(quote.volume)} />
-          </div>
-        ) : <div className="mt-4 text-sm opacity-75">输入股票代码，点击查询。</div>}
-      </div>
+     
     </div>
   );
 }
@@ -250,11 +245,6 @@ function btn(mode: "glass" | "senior") {
   return mode === "glass"
     ? "rounded-2xl bg-white/10 px-3 py-2 text-sm font-medium hover:bg-white/15 border border-white/15"
     : "rounded-xl bg-slate-900 px-4 py-3 text-base font-bold text-white hover:bg-slate-800";
-}
-function primary(mode: "glass" | "senior") {
-  return mode === "glass"
-    ? "rounded-2xl bg-white/15 px-4 py-3 text-sm font-semibold hover:bg-white/20 border border-white/15"
-    : "rounded-xl bg-red-600 px-5 py-4 text-lg font-bold text-white hover:bg-red-700";
 }
 function input(mode: "glass" | "senior") {
   return mode === "glass"
